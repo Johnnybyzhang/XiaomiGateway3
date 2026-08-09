@@ -14,7 +14,10 @@ CONFIG_ENTRIES: dict[str, MultiGateway] = {}  # key is device did
 
 
 def handle_add_entities(
-    hass: HomeAssistant, config_entry: ConfigEntry, gw: MultiGateway
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    gw: MultiGateway,
+    config_subentry_id: str = None,
 ):
     """Add entities when gateway calls the add_device event."""
     lazy_listeners: dict = {}
@@ -30,7 +33,14 @@ def handle_add_entities(
             # instant setup all entities, except lazy
             for entity in get_entities(device, gw.stats_domain):
                 gw.debug("add_entity", device=device, entity=entity.entity_id)
-                add_entity(hass, config_entry, entity)
+                add_entity(
+                    hass,
+                    config_entry,
+                    entity,
+                    config_subentry_id
+                    if device.type == GATEWAY
+                    else None,
+                )
 
             # add listener for setup lazy entities (if device has them)
             if remove_listener := handle_lazy_entities(hass, config_entry, device):
@@ -40,6 +50,9 @@ def handle_add_entities(
             # so we add device to the current config entry
             device_registry.async_get(hass).async_get_or_create(
                 config_entry_id=config_entry.entry_id,
+                config_subentry_id=(
+                    config_subentry_id if device.type == GATEWAY else None
+                ),
                 identifiers={(DOMAIN, device.uid)},
             )
 
@@ -91,7 +104,12 @@ def create_entity(device: XDevice, conv: BaseConv) -> XEntity:
     return cls(device, conv)
 
 
-def add_entity(hass: HomeAssistant, config_entry: ConfigEntry, entity: XEntity):
+def add_entity(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    entity: XEntity,
+    config_subentry_id: str = None,
+):
     # if device belong to multiple config entries - disabling one of config entry will
     # block any other config entry for creation device entities
     reg = entity_registry.async_get(hass)
@@ -102,7 +120,11 @@ def add_entity(hass: HomeAssistant, config_entry: ConfigEntry, entity: XEntity):
             reg.async_update_entity(entity_id=entity_id, disabled_by=None)
 
     async_add_entities = XEntity.ADD[config_entry.entry_id + entity.domain]
-    async_add_entities([entity], update_before_add=False)
+    async_add_entities(
+        [entity],
+        update_before_add=False,
+        config_subentry_id=config_subentry_id,
+    )
 
 
 def handle_lazy_entities(

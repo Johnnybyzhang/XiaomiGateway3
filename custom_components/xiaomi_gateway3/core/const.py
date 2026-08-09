@@ -1,5 +1,10 @@
 DOMAIN = "xiaomi_gateway3"
 
+CONF_SITE = "site"
+CONF_DEVICE_ROUTES = "device_routes"
+SUBENTRY_AUX_GATEWAY = "aux_gateway"
+ROUTE_MAIN = "main"
+
 GATEWAY = "gateway"
 ZIGBEE = "zigbee"
 BLE = "ble"
