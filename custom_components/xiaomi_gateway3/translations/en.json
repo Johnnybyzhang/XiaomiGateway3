@@ -129,7 +129,8 @@
       "title": "Legacy Xiaomi Gateway configuration can be migrated",
       "fix_flow": {
         "error": {
-          "migration_failed": "The selected entries could not be migrated. No source entry is intentionally removed until registry ownership has been transferred; check the logs before retrying."
+          "migration_failed": "The selected entries could not be migrated. No source entry is intentionally removed until registry ownership has been transferred; check the logs before retrying.",
+          "unsupported_core": "This migration requires Home Assistant Core 2026.8.1 or newer. Upgrade Home Assistant and restart before retrying Fix. No entries were changed by this blocked attempt."
         },
         "step": {
           "account": {
@@ -158,6 +159,20 @@
             "description": "Mi Cloud account: {account}\n\nMain gateway: {main_gateway}\n\nAuxiliary gateways: {aux_gateways}\n\nThe selected entries and their registry ownership will be changed only after confirmation.",
             "data": {
               "confirm": "Confirm Migration"
+            }
+          },
+          "resume": {
+            "title": "Continue an interrupted gateway migration",
+            "description": "A previous Fix attempt assembled a site before registry ownership could be transferred. Select the partially assembled site to finish explicitly.",
+            "data": {
+              "site": "Interrupted gateway site"
+            }
+          },
+          "resume_confirm": {
+            "title": "Confirm interrupted migration recovery",
+            "description": "Site: {site}\n\nMain gateway: {main_gateway}\n\nRemaining auxiliary sources: {aux_gateways}\n\nRegistry ownership will be transferred to the existing site. Legacy source entries are removed only after that site loads successfully.",
+            "data": {
+              "confirm": "Continue Migration"
             }
           }
         }
