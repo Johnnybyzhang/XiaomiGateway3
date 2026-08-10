@@ -1,0 +1,103 @@
+name: Finalize main gateway subentry v2
+
+on:
+  push:
+    branches:
+      - fix/main-gateway-subentry
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/main-gateway-subentry
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Ensure complete product patch
+        run: |
+          if ! grep -q 'SUBENTRY_MAIN_GATEWAY = "main_gateway"' \
+            custom_components/xiaomi_gateway3/core/const.py; then
+            test -f .github/scripts/add_main_gateway_subentry_core.py
+            python .github/scripts/add_main_gateway_subentry_core.py
+            python .github/scripts/add_main_gateway_subentry_migration.py
+            python .github/scripts/add_main_gateway_subentry_tests.py
+          fi
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("custom_components/xiaomi_gateway3/hass/migration.py")
+          text = path.read_text()
+          old = '''        if current.device_id in device_ids or (\n            include_entry_entities\n            and current.device_id is None\n            and current.config_subentry_id == source_subentry_id\n        ) or (\n'''
+          new = '''        if current.device_id in device_ids or (\n            include_entry_entities\n            and current.config_subentry_id == source_subentry_id\n        ) or (\n'''
+          if old in text:
+              path.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: Install Home Assistant 2026.8.0 validation environment
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "homeassistant==2026.8.0" pytest "zigpy>=0.52.3"
+
+      - name: Validate final tree
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m compileall -q custom_components/xiaomi_gateway3 tests
+          python - <<'PY'
+          import inspect
+          import json
+          from pathlib import Path
+          from homeassistant.config_entries import ConfigFlow
+          from custom_components.xiaomi_gateway3.config_flow import FlowHandler
+          from custom_components.xiaomi_gateway3.core.const import SUBENTRY_MAIN_GATEWAY
+          from custom_components.xiaomi_gateway3.hass.migration import TARGET_MINOR_VERSION
+          from custom_components.xiaomi_gateway3.hass.site import MAIN_GATEWAY_TITLE_PREFIX
+
+          assert "subentries" in inspect.signature(ConfigFlow.async_create_entry).parameters
+          assert FlowHandler.VERSION == 5
+          assert FlowHandler.MINOR_VERSION == 2
+          assert TARGET_MINOR_VERSION == 2
+          assert SUBENTRY_MAIN_GATEWAY == "main_gateway"
+          assert MAIN_GATEWAY_TITLE_PREFIX.startswith("0 ")
+          data = json.loads(Path("custom_components/xiaomi_gateway3/translations/en.json").read_text())
+          assert data["config_subentries"]["main_gateway"]["entry_type"] == "Main gateway"
+          PY
+          python -m pytest -q \
+            tests/test_gateway_route.py \
+            tests/test_migration.py \
+            tests/test_main_gateway_subentry.py
+          git diff --check
+
+      - name: Publish one clean product commit
+        run: |
+          git rm -f --ignore-unmatch \
+            .github/scripts/_main_subentry_probe.py \
+            .github/scripts/add_main_gateway_subentry_core.py \
+            .github/scripts/add_main_gateway_subentry_migration.py \
+            .github/scripts/add_main_gateway_subentry_tests.py \
+            .github/scripts/fix_main_gateway_subentry_edges.py \
+            .github/workflows/apply-main-gateway-subentry.yml \
+            .github/workflows/validate-main-gateway-subentry.yml \
+            .github/workflows/finalize-main-gateway-subentry.yml \
+            .github/workflows/finalize-main-gateway-subentry-v2.yml
+          git fetch origin master
+          git reset --soft origin/master
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            git reset --hard origin/master
+          else
+            git commit -m "fix: present main gateway as managed subentry"
+            # Publish master first so the branch push cannot cancel this run early.
+            git push origin HEAD:master
+          fi
+          git push --force origin HEAD:fix/main-gateway-subentry
