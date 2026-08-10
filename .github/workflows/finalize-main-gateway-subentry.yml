@@ -1,0 +1,114 @@
+name: Finalize main gateway subentry
+
+on:
+  push:
+    branches:
+      - fix/main-gateway-subentry
+
+permissions:
+  contents: write
+
+concurrency:
+  group: finalize-main-gateway-subentry
+  cancel-in-progress: true
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/main-gateway-subentry
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Ensure complete product patch
+        run: |
+          if ! grep -q 'SUBENTRY_MAIN_GATEWAY = "main_gateway"' \
+            custom_components/xiaomi_gateway3/core/const.py; then
+            python .github/scripts/add_main_gateway_subentry_core.py
+            python .github/scripts/add_main_gateway_subentry_migration.py
+            python .github/scripts/add_main_gateway_subentry_tests.py
+          fi
+          if grep -q 'include_entry_entities$' \
+            custom_components/xiaomi_gateway3/hass/migration.py; then
+            :
+          fi
+          if grep -q 'and current.device_id is None' \
+            custom_components/xiaomi_gateway3/hass/migration.py; then
+            python .github/scripts/fix_main_gateway_subentry_edges.py
+          fi
+
+      - name: Install Home Assistant 2026.8.0 validation environment
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "homeassistant==2026.8.0" pytest "zigpy>=0.52.3"
+
+      - name: Validate final tree
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m compileall -q custom_components/xiaomi_gateway3 tests
+          python - <<'PY'
+          import inspect
+          import json
+          from pathlib import Path
+
+          from homeassistant.config_entries import ConfigFlow
+          from custom_components.xiaomi_gateway3.config_flow import FlowHandler
+          from custom_components.xiaomi_gateway3.core.const import (
+              SUBENTRY_MAIN_GATEWAY,
+          )
+          from custom_components.xiaomi_gateway3.hass.migration import (
+              TARGET_MINOR_VERSION,
+          )
+          from custom_components.xiaomi_gateway3.hass.site import (
+              MAIN_GATEWAY_TITLE_PREFIX,
+          )
+
+          assert "subentries" in inspect.signature(
+              ConfigFlow.async_create_entry
+          ).parameters
+          assert FlowHandler.VERSION == 5
+          assert FlowHandler.MINOR_VERSION == 2
+          assert TARGET_MINOR_VERSION == 2
+          assert SUBENTRY_MAIN_GATEWAY == "main_gateway"
+          assert MAIN_GATEWAY_TITLE_PREFIX.startswith("0 ")
+          translations = json.loads(
+              Path(
+                  "custom_components/xiaomi_gateway3/translations/en.json"
+              ).read_text()
+          )
+          assert translations["config_subentries"]["main_gateway"][
+              "entry_type"
+          ] == "Main gateway"
+          PY
+          python -m pytest -q \
+            tests/test_gateway_route.py \
+            tests/test_migration.py \
+            tests/test_main_gateway_subentry.py
+          git diff --check
+
+      - name: Squash to one clean product commit
+        run: |
+          git rm -f --ignore-unmatch \
+            .github/scripts/_main_subentry_probe.py \
+            .github/scripts/add_main_gateway_subentry_core.py \
+            .github/scripts/add_main_gateway_subentry_migration.py \
+            .github/scripts/add_main_gateway_subentry_tests.py \
+            .github/scripts/fix_main_gateway_subentry_edges.py \
+            .github/workflows/apply-main-gateway-subentry.yml \
+            .github/workflows/validate-main-gateway-subentry.yml \
+            .github/workflows/finalize-main-gateway-subentry.yml
+          git fetch origin master
+          git reset --soft origin/master
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: present main gateway as managed subentry"
+          git push --force origin HEAD:fix/main-gateway-subentry
+          git push origin HEAD:master
