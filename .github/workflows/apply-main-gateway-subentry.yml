@@ -1,0 +1,95 @@
+name: Apply main gateway subentry
+
+on:
+  push:
+    branches:
+      - fix/main-gateway-subentry
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/main-gateway-subentry
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Apply product patch
+        run: |
+          python .github/scripts/add_main_gateway_subentry_core.py
+          python .github/scripts/add_main_gateway_subentry_migration.py
+          python .github/scripts/add_main_gateway_subentry_tests.py
+
+      - name: Install Home Assistant 2026.8.0 validation environment
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "homeassistant==2026.8.0" pytest "zigpy>=0.52.3"
+
+      - name: Validate product patch
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m compileall -q custom_components/xiaomi_gateway3 tests
+          python - <<'PY'
+          import inspect
+          import json
+          from pathlib import Path
+
+          from homeassistant.config_entries import ConfigFlow
+
+          from custom_components.xiaomi_gateway3.config_flow import FlowHandler
+          from custom_components.xiaomi_gateway3.core.const import (
+              SUBENTRY_MAIN_GATEWAY,
+          )
+          from custom_components.xiaomi_gateway3.hass.migration import (
+              TARGET_MINOR_VERSION,
+          )
+          from custom_components.xiaomi_gateway3.hass.site import (
+              MAIN_GATEWAY_TITLE_PREFIX,
+          )
+
+          assert "subentries" in inspect.signature(
+              ConfigFlow.async_create_entry
+          ).parameters
+          assert FlowHandler.VERSION == 5
+          assert FlowHandler.MINOR_VERSION == 2
+          assert TARGET_MINOR_VERSION == 2
+          assert SUBENTRY_MAIN_GATEWAY == "main_gateway"
+          assert MAIN_GATEWAY_TITLE_PREFIX.startswith("0 ")
+          json.loads(
+              Path(
+                  "custom_components/xiaomi_gateway3/translations/en.json"
+              ).read_text()
+          )
+          PY
+          python -m pytest -q \
+            tests/test_gateway_route.py \
+            tests/test_migration.py \
+            tests/test_main_gateway_subentry.py
+          git diff --check
+
+      - name: Commit product changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            custom_components/xiaomi_gateway3/__init__.py \
+            custom_components/xiaomi_gateway3/config_flow.py \
+            custom_components/xiaomi_gateway3/core/const.py \
+            custom_components/xiaomi_gateway3/hass/add_entitites.py \
+            custom_components/xiaomi_gateway3/hass/entity.py \
+            custom_components/xiaomi_gateway3/hass/migration.py \
+            custom_components/xiaomi_gateway3/hass/site.py \
+            custom_components/xiaomi_gateway3/translations/en.json \
+            tests/test_migration.py \
+            tests/test_main_gateway_subentry.py
+          git commit -m "fix: present main gateway as managed subentry"
+          git push origin HEAD:fix/main-gateway-subentry
