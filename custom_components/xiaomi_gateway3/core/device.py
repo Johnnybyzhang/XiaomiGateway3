@@ -11,6 +11,7 @@ from .converters.base import BaseConv, decode_time, encode_time
 from .converters.lumi import LUMI_GLOBALS
 from .converters.zigbee import ZConverter
 from .devices import DEVICES
+from .gateway_route import select_gateway
 
 if TYPE_CHECKING:
     from .gate.base import XGateway
@@ -84,6 +85,10 @@ class XDevice:
     def __init__(self, model: str | int, **kwargs):
         self.available: bool = False
         self.gateways: list["XGateway"] = []
+        # Set only by the UI-managed GatewaySite runtime. Legacy entries leave
+        # these unset and keep the upstream selection policy unchanged.
+        self.preferred_gateway: Optional["XGateway"] = None
+        self.default_gateway: Optional["XGateway"] = None
         self.extra: XDeviceExtra = kwargs
         self.listeners: list[Callable] = []
         self.model = model
@@ -468,10 +473,12 @@ class XDevice:
     @property
     def send_gateway(self) -> "XGateway":
         """Select best gateway for send command (write or read)."""
-        if self.last_report_gw in self.gateways and self.last_report_gw.available:
-            return self.last_report_gw
-
-        return next((i for i in self.gateways if i.available), None)
+        return select_gateway(
+            self.gateways,
+            self.preferred_gateway,
+            self.default_gateway,
+            self.last_report_gw,
+        )
 
     def write(self, payload: dict):
         """Send write command to device."""

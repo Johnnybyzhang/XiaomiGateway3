@@ -8,7 +8,8 @@
       "wrong_model": "Unsupported gateway model",
       "wrong_token": "Wrong Mi Home token",
       "wrong_telnet": "Wrong open telnet command",
-      "verify": "Click to verify url"
+      "verify": "Click to verify url",
+      "no_gateways": "No supported gateway was found in this account"
     },
     "step": {
       "user": {
@@ -47,10 +48,23 @@
           "token": "Token",
           "key": "Key"
         }
+      },
+      "main_gateway": {
+        "title": "Select Main Gateway",
+        "data": {
+          "did": "Main Gateway"
+        }
       }
+    },
+    "abort": {
+      "already_configured": "Gateway or account is already configured",
+      "site_created": "Gateway site configured"
     }
   },
   "options": {
+    "error": {
+      "migration_failed": "The main gateway could not be changed. The existing configuration was kept where possible; check the logs before retrying."
+    },
     "step": {
       "cloud": {
         "title": "MiCloud devices info",
@@ -69,6 +83,83 @@
           "ble": "Support Bluetooth devices",
           "stats": "Add statistic sensors",
           "debug": "Debug logs"
+        }
+      },
+      "site": {
+        "title": "Gateway Site",
+        "data": {
+          "action": "Action"
+        }
+      },
+      "change_main": {
+        "title": "Change Main Gateway",
+        "description": "Select an existing auxiliary gateway to promote. The current main gateway will become an auxiliary gateway.",
+        "data": {
+          "gateway": "New Main Gateway"
+        }
+      },
+      "change_main_confirm": {
+        "title": "Confirm Main Gateway Change",
+        "description": "Promote {gateway} to main? Devices without an explicit route will use this gateway. The former main gateway will remain available as an auxiliary gateway.",
+        "data": {
+          "confirm": "Confirm"
+        }
+      },
+      "device_routes": {
+        "title": "Device Routing",
+        "data": {
+          "device": "Device"
+        }
+      },
+      "device_route": {
+        "title": "Route {device}",
+        "data": {
+          "gateway": "Gateway"
+        }
+      }
+    },
+    "abort": {
+      "no_devices": "No devices are currently provided by this gateway site",
+      "no_aux_gateways": "No auxiliary gateway is available to promote",
+      "main_gateway_changed": "The selected auxiliary gateway is now the main gateway"
+    }
+  },
+  "issues": {
+    "legacy_config_migration": {
+      "title": "Legacy Xiaomi Gateway configuration can be migrated",
+      "fix_flow": {
+        "error": {
+          "migration_failed": "The selected entries could not be migrated. No source entry is intentionally removed until registry ownership has been transferred; check the logs before retrying."
+        },
+        "step": {
+          "account": {
+            "title": "Select Mi Cloud Account",
+            "description": "Optionally use an existing Mi Cloud entry as the parent of this gateway site. Nothing is migrated automatically.",
+            "data": {
+              "account": "Mi Cloud Account"
+            }
+          },
+          "main_gateway": {
+            "title": "Select Main Gateway",
+            "description": "Choose the gateway that should be the default route. The oldest entry, {suggested_main}, is preselected only as a suggestion and will not be applied until you confirm the complete migration.",
+            "data": {
+              "main_gateway": "Main Gateway"
+            }
+          },
+          "aux_gateways": {
+            "title": "Select Auxiliary Gateways",
+            "description": "Select the remaining legacy gateways that should be moved into this site. Unselected entries remain unchanged and can be migrated later.",
+            "data": {
+              "aux_gateways": "Auxiliary Gateways"
+            }
+          },
+          "confirm": {
+            "title": "Confirm Gateway Site Migration",
+            "description": "Mi Cloud account: {account}\n\nMain gateway: {main_gateway}\n\nAuxiliary gateways: {aux_gateways}\n\nThe selected entries and their registry ownership will be changed only after confirmation.",
+            "data": {
+              "confirm": "Confirm Migration"
+            }
+          }
         }
       }
     }
@@ -119,6 +210,47 @@
           "no_devices": "No devices",
           "original": "Original",
           "custom": "Custom"
+        }
+      }
+    }
+  },
+  "config_subentries": {
+    "aux_gateway": {
+      "entry_type": "Aux gateway",
+      "initiate_flow": {
+        "user": "Add aux gateway"
+      },
+      "abort": {
+        "already_configured": "Gateway is already configured",
+        "reconfigure_successful": "Aux gateway updated"
+      },
+      "error": {
+        "cant_connect": "Can't connect to gateway",
+        "no_key": "Unsupported gateway firmware without key",
+        "wrong_model": "Unsupported gateway model",
+        "wrong_token": "Wrong Mi Home token",
+        "wrong_telnet": "Wrong open telnet command"
+      },
+      "step": {
+        "user": {
+          "title": "Add Aux Gateway",
+          "data": {
+            "host": "Host",
+            "token": "Token",
+            "key": "Key",
+            "stats": "Add statistic sensors",
+            "debug": "Debug logs"
+          }
+        },
+        "reconfigure": {
+          "title": "Configure Aux Gateway",
+          "data": {
+            "host": "Host",
+            "token": "Token",
+            "key": "Key",
+            "stats": "Add statistic sensors",
+            "debug": "Debug logs"
+          }
         }
       }
     }

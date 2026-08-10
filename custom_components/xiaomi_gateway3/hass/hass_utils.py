@@ -138,11 +138,11 @@ async def store_gateway_key(hass: HomeAssistant, config_entry: ConfigEntry):
         return
 
     info = await core_utils.gateway_info(options["host"], options["token"])
-    if not info.get("key"):
+    if not info or not info.get("key"):
         return
 
     options = {**options, "key": info["key"]}
-    hass.config_entries.async_update_entry(config_entry, data={}, options=options)
+    hass.config_entries.async_update_entry(config_entry, options=options)
 
     store = Store(hass, 1, f"{DOMAIN}/keys.json")
     data = await store.async_load() or {}
@@ -154,8 +154,8 @@ async def restore_gateway_key(hass: HomeAssistant, token: str) -> str | None:
     store = Store(hass, 1, f"{DOMAIN}/keys.json")
     if data := await store.async_load():
         for device in data.values():
-            if device["token"] == token:
-                return device["key"]
+            if device.get("token") == token:
+                return device.get("key")
     return None
 
 

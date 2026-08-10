@@ -141,12 +141,11 @@ Or manually copy `xiaomi_gateway3` folder from [latest release](https://github.c
 
 If the integration is not in the list, you need to clear the browser cache.
 
-You need to add integration two times:
+Add the integration once for each Mi Home account and physical space. During setup, sign in to Mi Cloud and select the main gateway, or configure the main gateway directly with its token.
 
-1. Cloud version. It used ONLY to load tokens and names for your devices from cloud.
-2. Gateway. It adds your gateway and all connected Zigbee, BLE and Mesh devices.
+After setup, open the integration entry to add each additional gateway as an **Aux gateway**. Device-to-gateway routing and **Change Main Gateway** are configured from the same UI. Existing YAML device customization remains supported and is independent of this feature.
 
-You may skip 1st step if you know token for you Gateway. If you have multiple Gateways - repeat step 2 for each of them.
+Existing separate cloud and gateway entries are never consolidated automatically. Home Assistant exposes a **Repairs** item instead. Open **Fix**, explicitly select the optional Mi Cloud account, main gateway, and auxiliary gateways, then confirm the complete migration. The oldest gateway may be preselected as a suggestion only.
 
 You need gateway `key` only for Xiaomi Multimode Gateway on fw 1.5.5, [read more](https://github.com/AlexxIT/Blog/issues/13).
 
@@ -208,6 +207,8 @@ Zigbee devices can be attached (paired) to only one gateway. I recommend to spli
 Bluetooth BLE and Mesh devices can work simultaneously with all gateways. In this technology, there is no binding to the gateway.
 
 If a user has more than one Bluetooth Mesh Gateway on the network - only one will send Bluetooth device data to the cloud. But this integration can continue to collect Bluetooth data from all gateways simultaneously and locally.
+
+In the UI-managed setup, unassigned devices use the main gateway. Open **Configure Device Routing** on the integration entry to assign a specific device to an auxiliary gateway. Shared child devices remain owned by the parent site entry, so removing an auxiliary gateway preserves devices still supplied by the main or another auxiliary gateway and removes only devices exclusive to the deleted auxiliary.
 
 ## Device command select
 
