@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+from dataclasses import dataclass
+import inspect
 import logging
 from types import MappingProxyType
 from typing import Any
@@ -13,6 +15,7 @@ from homeassistant.config_entries import (
     ConfigEntryState,
     ConfigSubentry,
 )
+from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import (
     device_registry,
@@ -32,12 +35,64 @@ _LOGGER = logging.getLogger(__name__)
 
 TARGET_VERSION = 5
 TARGET_MINOR_VERSION = 1
+MINIMUM_HA_VERSION = "2026.8.1"
 ISSUE_LEGACY_CONFIG_MIGRATION = "legacy_config_migration"
 _NO_VIA_UPDATE = object()
 
 
 class MigrationError(RuntimeError):
     """Raised when a requested gateway topology migration cannot be completed."""
+
+
+class UnsupportedCoreVersionError(MigrationError):
+    """Raised before mutation when Core lacks the required registry model."""
+
+
+@dataclass(frozen=True)
+class InterruptedMigration:
+    """A site parent left assembled while its legacy sources still exist."""
+
+    parent: ConfigEntry
+    main: ConfigEntry
+    auxiliaries: tuple[tuple[ConfigEntry, ConfigSubentry], ...]
+
+
+def _registry_api_supported(
+    device_attributes: set[str], update_parameters: set[str]
+) -> bool:
+    """Return whether Core exposes the singular 2026.8 registry API."""
+    return {
+        "config_entry_id",
+        "config_subentry_id",
+    } <= device_attributes and {
+        "new_config_entry_id",
+        "new_config_subentry_id",
+    } <= update_parameters
+
+
+def is_registry_migration_supported() -> bool:
+    """Return whether the running Core supports this migration implementation."""
+    device_attributes = {
+        attribute.name
+        for attribute in device_registry.DeviceEntry.__attrs_attrs__
+    }
+    update_parameters = set(
+        inspect.signature(
+            device_registry.DeviceRegistry.async_update_device
+        ).parameters
+    )
+    return _registry_api_supported(device_attributes, update_parameters)
+
+
+def ensure_registry_migration_supported() -> None:
+    """Reject unsupported Core versions before unloading or mutating entries."""
+    if is_registry_migration_supported():
+        return
+    raise UnsupportedCoreVersionError(
+        "Legacy gateway migration requires Home Assistant Core "
+        f"{MINIMUM_HA_VERSION} or newer; running {HA_VERSION}. "
+        "No config entries were changed by this attempt."
+    )
 
 
 def is_site_entry(entry: ConfigEntry) -> bool:
@@ -104,6 +159,78 @@ def cloud_entry_label(entry: ConfigEntry) -> str:
     username = str(entry.data.get("username") or entry.title)
     servers = ", ".join(entry.data.get("servers", [])) or "default server"
     return f"{username} — {servers}"
+
+
+def _gateway_options_match(
+    left: dict[str, Any], right: dict[str, Any]
+) -> bool:
+    """Match two gateway configurations without relying on mutable titles."""
+    left_did = left.get("did")
+    right_did = right.get("did")
+    if left_did and right_did:
+        return str(left_did) == str(right_did)
+
+    token = left.get("token")
+    return bool(
+        token
+        and token == right.get("token")
+        and left.get("host")
+        and left.get("host") == right.get("host")
+    )
+
+
+def interrupted_migration_sites(
+    hass: HomeAssistant,
+) -> list[InterruptedMigration]:
+    """Find cloud-backed site parents whose selected legacy sources still exist."""
+    gateways = legacy_gateway_entries(hass)
+    if not gateways:
+        return []
+
+    interrupted: list[InterruptedMigration] = []
+    for parent in hass.config_entries.async_entries(DOMAIN):
+        if not is_site_entry(parent) or not parent.data.get("username"):
+            continue
+
+        main = next(
+            (
+                gateway
+                for gateway in gateways
+                if _gateway_options_match(
+                    dict(parent.options), dict(gateway.options)
+                )
+            ),
+            None,
+        )
+        if main is None:
+            continue
+
+        used_ids = {main.entry_id}
+        auxiliaries: list[tuple[ConfigEntry, ConfigSubentry]] = []
+        for subentry in parent.subentries.values():
+            if subentry.subentry_type != SUBENTRY_AUX_GATEWAY:
+                continue
+            source = next(
+                (
+                    gateway
+                    for gateway in gateways
+                    if gateway.entry_id not in used_ids
+                    and _gateway_options_match(
+                        dict(subentry.data), dict(gateway.options)
+                    )
+                ),
+                None,
+            )
+            if source is None:
+                continue
+            used_ids.add(source.entry_id)
+            auxiliaries.append((source, subentry))
+
+        interrupted.append(
+            InterruptedMigration(parent, main, tuple(auxiliaries))
+        )
+
+    return sorted(interrupted, key=lambda item: _entry_order(item.parent))
 
 
 async def async_refresh_migration_issue(hass: HomeAssistant) -> None:
@@ -418,6 +545,7 @@ async def async_migrate_legacy_site(
     aux_entry_ids: Iterable[str],
 ) -> ConfigEntry:
     """Apply a topology selected and confirmed through a Repairs flow."""
+    ensure_registry_migration_supported()
     gateways = {entry.entry_id: entry for entry in legacy_gateway_entries(hass)}
     clouds = {entry.entry_id: entry for entry in legacy_cloud_entries(hass)}
 
@@ -536,6 +664,75 @@ async def async_migrate_legacy_site(
     return parent
 
 
+async def async_resume_interrupted_site(
+    hass: HomeAssistant,
+    parent_entry_id: str,
+) -> ConfigEntry:
+    """Finish a user-confirmed migration interrupted before source cleanup."""
+    ensure_registry_migration_supported()
+    candidates = {
+        item.parent.entry_id: item for item in interrupted_migration_sites(hass)
+    }
+    if (candidate := candidates.get(parent_entry_id)) is None:
+        raise MigrationError("The interrupted gateway migration no longer exists")
+
+    parent = candidate.parent
+    sources = [candidate.main, *(item[0] for item in candidate.auxiliaries)]
+    entries: list[ConfigEntry] = []
+    for entry in (parent, *sources):
+        if entry not in entries:
+            entries.append(entry)
+
+    loaded_ids = await _unload_entries(hass, entries)
+    try:
+        _move_entry_registry(
+            hass,
+            candidate.main.entry_id,
+            parent.entry_id,
+            gateway_subentry_id=None,
+        )
+
+        parent_devices = _devices_for_entry(
+            device_registry.async_get(hass), parent.entry_id
+        )
+        main_roots = _gateway_root_ids(
+            device
+            for device in parent_devices
+            if device.config_subentry_id is None
+        )
+        child_anchor_id = min(main_roots) if main_roots else None
+
+        for auxiliary, subentry in candidate.auxiliaries:
+            _move_entry_registry(
+                hass,
+                auxiliary.entry_id,
+                parent.entry_id,
+                gateway_subentry_id=subentry.subentry_id,
+                child_anchor_id=child_anchor_id,
+            )
+
+        if not await hass.config_entries.async_setup(parent.entry_id):
+            raise MigrationError("The interrupted gateway site could not be set up")
+
+        # Source entries are removed only after the existing site loads successfully.
+        for source in sources:
+            if hass.config_entries.async_get_entry(source.entry_id) is not None:
+                await hass.config_entries.async_remove(source.entry_id)
+    except Exception as err:
+        await _restore_loaded_entries(hass, loaded_ids)
+        if isinstance(err, MigrationError):
+            raise
+        raise MigrationError(
+            "Unexpected failure while resuming gateway migration"
+        ) from err
+
+    hass.async_create_task(
+        _async_refresh_migration_issue_after_fix(hass),
+        "refresh XiaomiGateway3 interrupted migration repair",
+    )
+    return parent
+
+
 def _promoted_main_options(
     current_options: dict[str, Any],
     promoted_data: dict[str, Any],
@@ -581,6 +778,7 @@ async def async_promote_aux_gateway(
     subentry_id: str,
 ) -> None:
     """Promote an explicitly selected auxiliary gateway to main."""
+    ensure_registry_migration_supported()
     if not is_site_entry(entry):
         raise MigrationError("This config entry is not a gateway site")
     selected = entry.subentries.get(subentry_id)

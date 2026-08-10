@@ -17,10 +17,14 @@ from homeassistant.core import HomeAssistant
 from .hass.migration import (
     ISSUE_LEGACY_CONFIG_MIGRATION,
     MigrationError,
+    InterruptedMigration,
+    UnsupportedCoreVersionError,
     async_migrate_legacy_site,
     async_refresh_migration_issue,
+    async_resume_interrupted_site,
     cloud_entry_label,
     gateway_entry_label,
+    interrupted_migration_sites,
     legacy_cloud_entries,
     legacy_gateway_entries,
 )
@@ -29,6 +33,7 @@ CONF_ACCOUNT = "account"
 CONF_MAIN_GATEWAY = "main_gateway"
 CONF_AUX_GATEWAYS = "aux_gateways"
 CONF_CONFIRM = "confirm"
+CONF_INTERRUPTED_SITE = "site"
 NO_ACCOUNT = "none"
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,6 +44,7 @@ class LegacyConfigMigrationFlow(RepairsFlow):
 
     cloud_entry_id: str | None = None
     main_entry_id: str | None = None
+    resume_parent_id: str | None = None
     aux_entry_ids: list[str]
 
     def __init__(self) -> None:
@@ -50,6 +56,8 @@ class LegacyConfigMigrationFlow(RepairsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> RepairsFlowResult:
         """Start the migration wizard without modifying any entry."""
+        if interrupted_migration_sites(self.hass):
+            return await self.async_step_resume()
         if not legacy_gateway_entries(self.hass):
             await async_refresh_migration_issue(self.hass)
             return self.async_create_entry(data={})
@@ -143,6 +151,92 @@ class LegacyConfigMigrationFlow(RepairsFlow):
             ),
         )
 
+    async def async_step_resume(
+        self, user_input: dict[str, Any] | None = None
+    ) -> RepairsFlowResult:
+        """Select a partially assembled site to finish explicitly."""
+        candidates = interrupted_migration_sites(self.hass)
+        if not candidates:
+            return await self.async_step_init()
+
+        choices = {
+            item.parent.entry_id: (
+                f"{item.parent.title} — main: "
+                f"{gateway_entry_label(item.main)}"
+            )
+            for item in candidates
+        }
+        if len(candidates) == 1 and user_input is None:
+            self.resume_parent_id = candidates[0].parent.entry_id
+            return await self.async_step_resume_confirm()
+        if user_input is not None:
+            self.resume_parent_id = user_input[CONF_INTERRUPTED_SITE]
+            return await self.async_step_resume_confirm()
+
+        return self.async_show_form(
+            step_id="resume",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_INTERRUPTED_SITE,
+                        default=candidates[0].parent.entry_id,
+                    ): vol.In(choices)
+                }
+            ),
+        )
+
+    def _resume_candidate(self) -> InterruptedMigration | None:
+        return next(
+            (
+                item
+                for item in interrupted_migration_sites(self.hass)
+                if item.parent.entry_id == self.resume_parent_id
+            ),
+            None,
+        )
+
+    async def async_step_resume_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> RepairsFlowResult:
+        """Finish the interrupted topology only after explicit confirmation."""
+        candidate = self._resume_candidate()
+        if candidate is None:
+            return await self.async_step_init()
+
+        errors: dict[str, str] = {}
+        if user_input is not None and user_input.get(CONF_CONFIRM):
+            try:
+                await async_resume_interrupted_site(
+                    self.hass, candidate.parent.entry_id
+                )
+            except UnsupportedCoreVersionError as err:
+                _LOGGER.warning("Interrupted migration blocked: %s", err)
+                errors["base"] = "unsupported_core"
+            except MigrationError as err:
+                _LOGGER.error("Interrupted migration failed", exc_info=err)
+                errors["base"] = "migration_failed"
+            else:
+                return self.async_create_entry(data={})
+
+        auxiliaries = [
+            gateway_entry_label(source)
+            for source, _ in candidate.auxiliaries
+        ]
+        return self.async_show_form(
+            step_id="resume_confirm",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_CONFIRM, default=False): bool}
+            ),
+            description_placeholders={
+                "site": candidate.parent.title,
+                "main_gateway": gateway_entry_label(candidate.main),
+                "aux_gateways": (
+                    ", ".join(auxiliaries) if auxiliaries else "None"
+                ),
+            },
+            errors=errors,
+        )
+
     def _selection_summary(self) -> dict[str, str]:
         gateways = {
             entry.entry_id: entry for entry in legacy_gateway_entries(self.hass)
@@ -177,6 +271,9 @@ class LegacyConfigMigrationFlow(RepairsFlow):
                     main_entry_id=self.main_entry_id,
                     aux_entry_ids=self.aux_entry_ids,
                 )
+            except UnsupportedCoreVersionError as err:
+                _LOGGER.warning("Legacy gateway migration blocked: %s", err)
+                errors["base"] = "unsupported_core"
             except (MigrationError, AssertionError) as err:
                 _LOGGER.error("Legacy gateway migration failed", exc_info=err)
                 errors["base"] = "migration_failed"
