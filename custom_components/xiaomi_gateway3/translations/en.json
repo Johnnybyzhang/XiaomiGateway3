@@ -130,7 +130,7 @@
       "fix_flow": {
         "error": {
           "migration_failed": "The selected entries could not be migrated. No source entry is intentionally removed until registry ownership has been transferred; check the logs before retrying.",
-          "unsupported_core": "This migration requires Home Assistant Core 2026.8.1 or newer. Upgrade Home Assistant and restart before retrying Fix. No entries were changed by this blocked attempt."
+          "unsupported_core": "This migration requires Home Assistant Core 2026.8.0 or newer. Upgrade Home Assistant and restart before retrying Fix. No entries were changed by this blocked attempt."
         },
         "step": {
           "account": {

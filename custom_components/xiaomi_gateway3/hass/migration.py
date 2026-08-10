@@ -35,7 +35,7 @@ _LOGGER = logging.getLogger(__name__)
 
 TARGET_VERSION = 5
 TARGET_MINOR_VERSION = 1
-MINIMUM_HA_VERSION = "2026.8.1"
+MINIMUM_HA_VERSION = "2026.8.0"
 ISSUE_LEGACY_CONFIG_MIGRATION = "legacy_config_migration"
 _NO_VIA_UPDATE = object()
 
@@ -182,17 +182,23 @@ def _gateway_options_match(
 def interrupted_migration_sites(
     hass: HomeAssistant,
 ) -> list[InterruptedMigration]:
-    """Find cloud-backed site parents whose selected legacy sources still exist."""
+    """Find site parents whose selected legacy sources still exist.
+
+    A cloud-backed migration normally has a surviving legacy main source. A
+    token-only migration uses the already-converted parent itself as main. On a
+    later retry the main source may also have completed while auxiliary sources
+    remain, so recovery must not require a separate cloud or main entry.
+    """
     gateways = legacy_gateway_entries(hass)
     if not gateways:
         return []
 
     interrupted: list[InterruptedMigration] = []
     for parent in hass.config_entries.async_entries(DOMAIN):
-        if not is_site_entry(parent) or not parent.data.get("username"):
+        if not is_site_entry(parent):
             continue
 
-        main = next(
+        main_source = next(
             (
                 gateway
                 for gateway in gateways
@@ -202,10 +208,8 @@ def interrupted_migration_sites(
             ),
             None,
         )
-        if main is None:
-            continue
+        used_ids = {main_source.entry_id} if main_source is not None else set()
 
-        used_ids = {main.entry_id}
         auxiliaries: list[tuple[ConfigEntry, ConfigSubentry]] = []
         for subentry in parent.subentries.values():
             if subentry.subentry_type != SUBENTRY_AUX_GATEWAY:
@@ -226,8 +230,15 @@ def interrupted_migration_sites(
             used_ids.add(source.entry_id)
             auxiliaries.append((source, subentry))
 
+        if main_source is None and not auxiliaries:
+            continue
+
         interrupted.append(
-            InterruptedMigration(parent, main, tuple(auxiliaries))
+            InterruptedMigration(
+                parent,
+                main_source or parent,
+                tuple(auxiliaries),
+            )
         )
 
     return sorted(interrupted, key=lambda item: _entry_order(item.parent))
@@ -391,19 +402,163 @@ def _device_update_kwargs(
     return kwargs
 
 
+def _resolve_live_entity(registry: Any, snapshot: Any) -> Any | None:
+    """Resolve an entity snapshot after synchronous registry side effects."""
+    if current := registry.async_get(snapshot.entity_id):
+        return current
+
+    entity_id = registry.async_get_entity_id(
+        snapshot.domain, snapshot.platform, snapshot.unique_id
+    )
+    return registry.async_get(entity_id) if entity_id else None
+
+
+def _entity_update_kwargs(
+    current: Any,
+    target_entry_id: str,
+    target_subentry_id: str | None,
+    target_device_id: str | None,
+) -> dict[str, Any]:
+    """Return only ownership fields which actually need changing."""
+    update: dict[str, Any] = {}
+    entry_changed = current.config_entry_id != target_entry_id
+    if entry_changed:
+        update["config_entry_id"] = target_entry_id
+    if current.config_subentry_id != target_subentry_id or (
+        entry_changed and current.config_subentry_id is not None
+    ):
+        # Core requires config_subentry_id to be supplied when an entity with
+        # an existing subentry changes config entry, even if the ULID happens
+        # to compare equal in a synthetic or restored state.
+        update["config_subentry_id"] = target_subentry_id
+    if current.device_id != target_device_id:
+        update["device_id"] = target_device_id
+    return update
+
+
 def _move_entity(
     registry: Any,
     entity: Any,
     target_entry_id: str,
     target_subentry_id: str | None,
     target_device_id: str | None,
+) -> bool:
+    """Move a live entity if present, tolerating an already-removed snapshot."""
+    current = _resolve_live_entity(registry, entity)
+    if current is None:
+        _LOGGER.debug(
+            "Entity %s disappeared before registry ownership transfer",
+            entity.entity_id,
+        )
+        return False
+
+    for _ in range(2):
+        update = _entity_update_kwargs(
+            current,
+            target_entry_id,
+            target_subentry_id,
+            target_device_id,
+        )
+        if not update:
+            return True
+
+        try:
+            registry.async_update_entity(current.entity_id, **update)
+        except KeyError:
+            current = _resolve_live_entity(registry, entity)
+            if current is None:
+                _LOGGER.debug(
+                    "Entity %s was removed during registry ownership transfer",
+                    entity.entity_id,
+                )
+                return False
+        else:
+            return True
+
+    return False
+
+
+def _entities_for_device(registry: Any, device_id: str) -> list[Any]:
+    """Return a stable snapshot of every live entity attached to a device."""
+    return [
+        entity
+        for entity in list(registry.entities.values())
+        if entity.device_id == device_id
+    ]
+
+
+def _move_device_entities(
+    registry: Any,
+    device_ids: Iterable[str],
+    target_entry_id: str,
+    target_subentry_id: str | None,
+    target_device_id: str,
 ) -> None:
-    registry.async_update_entity(
-        entity.entity_id,
-        config_entry_id=target_entry_id,
-        config_subentry_id=target_subentry_id,
-        device_id=target_device_id,
-    )
+    """Move entities before changing device ownership.
+
+    Core 2026.8 synchronously removes entities which still carry a device's old
+    config-entry or subentry ownership when that device is moved. Moving both the
+    source and canonical-target entities first avoids that destructive callback.
+    """
+    seen: set[str] = set()
+    for device_id in device_ids:
+        for snapshot in _entities_for_device(registry, device_id):
+            current = _resolve_live_entity(registry, snapshot)
+            key = current.entity_id if current is not None else snapshot.entity_id
+            if key in seen:
+                continue
+            seen.add(key)
+            _move_entity(
+                registry,
+                snapshot,
+                target_entry_id,
+                target_subentry_id,
+                target_device_id,
+            )
+
+
+def _move_remaining_entry_entities(
+    dev_reg: Any,
+    ent_reg: Any,
+    source_entry_id: str,
+    target_entry_id: str,
+    device_map: dict[str, str],
+) -> None:
+    """Finish partially moved and entry-level entities idempotently."""
+    for snapshot in list(ent_reg.entities.values()):
+        current = _resolve_live_entity(ent_reg, snapshot)
+        if current is None or current.config_entry_id != source_entry_id:
+            continue
+
+        target_device_id = device_map.get(current.device_id)
+        if target_device_id is None and current.device_id is not None:
+            current_device = dev_reg.async_get(current.device_id)
+            if (
+                current_device is not None
+                and current_device.config_entry_id == target_entry_id
+            ):
+                target_device_id = current_device.id
+
+        target_subentry_id = None
+        if target_device_id is not None:
+            target_device = dev_reg.async_get(target_device_id)
+            if (
+                target_device is not None
+                and target_device.config_entry_id == target_entry_id
+            ):
+                target_subentry_id = target_device.config_subentry_id
+            else:
+                # Preserve the entity even if its stale device disappeared. The
+                # target integration will reattach it when the device is discovered.
+                target_device_id = None
+
+        _move_entity(
+            ent_reg,
+            current,
+            target_entry_id,
+            target_subentry_id,
+            target_device_id,
+        )
 
 
 def _move_entry_registry(
@@ -418,37 +573,71 @@ def _move_entry_registry(
     dev_reg = device_registry.async_get(hass)
     ent_reg = entity_registry.async_get(hass)
     source_devices = _devices_for_entry(dev_reg, source_entry_id)
-    source_entities = _entities_for_entry(ent_reg, source_entry_id)
     root_ids = _gateway_root_ids(source_devices)
-    entities_by_device: dict[str, list[Any]] = {}
-    entry_entities: list[Any] = []
-    for entity in source_entities:
-        if entity.device_id is None:
-            entry_entities.append(entity)
-        else:
-            entities_by_device.setdefault(entity.device_id, []).append(entity)
+
+    existing_target_roots = _gateway_root_ids(
+        device
+        for device in _devices_for_entry(dev_reg, target_entry_id)
+        if device.config_subentry_id == gateway_subentry_id
+    )
+    target_root_ids = set(existing_target_roots)
+    effective_child_anchor_id = child_anchor_id
+    if effective_child_anchor_id is None and existing_target_roots:
+        effective_child_anchor_id = min(existing_target_roots)
 
     device_map: dict[str, str] = {}
-    target_root_ids: set[str] = set()
     ordered_devices = sorted(
         source_devices,
         key=lambda device: (device.id not in root_ids, device.id),
     )
 
-    for source in ordered_devices:
-        is_root = source.id in root_ids
+    for snapshot in ordered_devices:
+        source = dev_reg.async_get(snapshot.id)
+        source_for_match = source or snapshot
+        is_root = snapshot.id in root_ids
         target_subentry_id = gateway_subentry_id if is_root else None
+
         if is_root:
             target_via_id: str | None | object = None
-        elif child_anchor_id is not None:
-            target_via_id = child_anchor_id
-        elif source.via_device_id in device_map:
-            target_via_id = device_map[source.via_device_id]
+        elif effective_child_anchor_id is not None:
+            target_via_id = effective_child_anchor_id
+        elif snapshot.via_device_id in device_map:
+            target_via_id = device_map[snapshot.via_device_id]
+        elif snapshot.via_device_id is not None and (
+            via_device := dev_reg.async_get(snapshot.via_device_id)
+        ) is not None and via_device.config_entry_id == target_entry_id:
+            target_via_id = via_device.id
         else:
             target_via_id = _NO_VIA_UPDATE
 
-        target = _matching_target_device(dev_reg, source, target_entry_id)
+        target = _matching_target_device(
+            dev_reg, source_for_match, target_entry_id
+        )
+        target_device_id = (
+            target.id if target is not None else source.id if source else None
+        )
+
+        if target_device_id is not None:
+            attached_device_ids = [snapshot.id]
+            if target is not None and target.id != snapshot.id:
+                attached_device_ids.append(target.id)
+            _move_device_entities(
+                ent_reg,
+                attached_device_ids,
+                target_entry_id,
+                target_subentry_id,
+                target_device_id,
+            )
+
         if target is None:
+            if source is None:
+                _LOGGER.warning(
+                    "Device %s disappeared before it could be transferred; "
+                    "its entities will be preserved for rediscovery",
+                    snapshot.id,
+                )
+                continue
+
             update: dict[str, Any] = {
                 "new_config_entry_id": target_entry_id,
                 "new_config_subentry_id": target_subentry_id,
@@ -462,45 +651,38 @@ def _move_entry_registry(
                 )
         else:
             update = _device_update_kwargs(
-                source, target, target_subentry_id, target_via_id
+                source_for_match,
+                target,
+                target_subentry_id,
+                target_via_id,
             )
             if update:
                 target = dev_reg.async_update_device(target.id, **update)
                 if target is None:
                     raise MigrationError(
-                        f"Canonical device {source.id} was unexpectedly removed"
+                        f"Canonical device {snapshot.id} was unexpectedly removed"
                     )
 
-        device_map[source.id] = target.id
+        device_map[snapshot.id] = target.id
         if is_root:
             target_root_ids.add(target.id)
+            if effective_child_anchor_id is None:
+                effective_child_anchor_id = target.id
 
-        for entity in entities_by_device.pop(source.id, []):
-            _move_entity(
-                ent_reg,
-                entity,
-                target_entry_id,
-                target_subentry_id,
-                target.id,
-            )
-
-        if target.id != source.id and dev_reg.async_get(source.id) is not None:
+        if (
+            source is not None
+            and target.id != source.id
+            and dev_reg.async_get(source.id) is not None
+        ):
             dev_reg.async_remove_device(source.id)
 
-    for entities in entities_by_device.values():
-        for entity in entities:
-            target_device_id = device_map.get(entity.device_id)
-            _move_entity(
-                ent_reg,
-                entity,
-                target_entry_id,
-                None,
-                target_device_id,
-            )
-
-    for entity in entry_entities:
-        _move_entity(ent_reg, entity, target_entry_id, None, None)
-
+    _move_remaining_entry_entities(
+        dev_reg,
+        ent_reg,
+        source_entry_id,
+        target_entry_id,
+        device_map,
+    )
     return target_root_ids
 
 
@@ -677,7 +859,15 @@ async def async_resume_interrupted_site(
         raise MigrationError("The interrupted gateway migration no longer exists")
 
     parent = candidate.parent
-    sources = [candidate.main, *(item[0] for item in candidate.auxiliaries)]
+    main_source = (
+        candidate.main
+        if candidate.main.entry_id != parent.entry_id
+        else None
+    )
+    sources = [
+        *([main_source] if main_source is not None else []),
+        *(item[0] for item in candidate.auxiliaries),
+    ]
     entries: list[ConfigEntry] = []
     for entry in (parent, *sources):
         if entry not in entries:
@@ -685,12 +875,13 @@ async def async_resume_interrupted_site(
 
     loaded_ids = await _unload_entries(hass, entries)
     try:
-        _move_entry_registry(
-            hass,
-            candidate.main.entry_id,
-            parent.entry_id,
-            gateway_subentry_id=None,
-        )
+        if main_source is not None:
+            _move_entry_registry(
+                hass,
+                main_source.entry_id,
+                parent.entry_id,
+                gateway_subentry_id=None,
+            )
 
         parent_devices = _devices_for_entry(
             device_registry.async_get(hass), parent.entry_id
@@ -759,16 +950,21 @@ def _move_subentry_entities(
     target_subentry_id: str | None,
     device_ids: set[str],
 ) -> None:
-    for entity in list(registry.entities.values()):
-        if entity.config_entry_id != entry_id:
+    """Move entity subentry ownership before moving the corresponding devices."""
+    for snapshot in list(registry.entities.values()):
+        current = _resolve_live_entity(registry, snapshot)
+        if current is None or current.config_entry_id != entry_id:
             continue
-        if entity.device_id in device_ids or (
-            entity.config_subentry_id == source_subentry_id
+        if current.device_id in device_ids or (
+            current.config_subentry_id == source_subentry_id
             and source_subentry_id is not None
         ):
-            registry.async_update_entity(
-                entity.entity_id,
-                config_subentry_id=target_subentry_id,
+            _move_entity(
+                registry,
+                current,
+                entry_id,
+                target_subentry_id,
+                current.device_id,
             )
 
 
@@ -817,10 +1013,6 @@ async def async_promote_aux_gateway(
             if device.config_subentry_id == subentry_id
         }
 
-        for device_id in promoted_ids:
-            dev_reg.async_update_device(
-                device_id, new_config_subentry_id=None
-            )
         _move_subentry_entities(
             ent_reg,
             entry.entry_id,
@@ -828,12 +1020,12 @@ async def async_promote_aux_gateway(
             None,
             promoted_ids,
         )
+        for device_id in promoted_ids:
+            if dev_reg.async_get(device_id) is not None:
+                dev_reg.async_update_device(
+                    device_id, new_config_subentry_id=None
+                )
 
-        for device_id in old_main_ids:
-            dev_reg.async_update_device(
-                device_id,
-                new_config_subentry_id=old_main_subentry.subentry_id,
-            )
         _move_subentry_entities(
             ent_reg,
             entry.entry_id,
@@ -841,6 +1033,12 @@ async def async_promote_aux_gateway(
             old_main_subentry.subentry_id,
             old_main_ids,
         )
+        for device_id in old_main_ids:
+            if dev_reg.async_get(device_id) is not None:
+                dev_reg.async_update_device(
+                    device_id,
+                    new_config_subentry_id=old_main_subentry.subentry_id,
+                )
 
         hass.config_entries.async_update_entry(entry, options=new_options)
         hass.config_entries.async_remove_subentry(entry, subentry_id)
