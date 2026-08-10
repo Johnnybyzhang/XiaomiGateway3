@@ -2,8 +2,11 @@ from types import SimpleNamespace
 
 from custom_components.xiaomi_gateway3.core.const import CONF_DEVICE_ROUTES
 from custom_components.xiaomi_gateway3.hass.migration import (
+    MINIMUM_HA_VERSION,
     _gateway_root_ids,
     _promoted_main_options,
+    _registry_api_supported,
+    is_registry_migration_supported,
     legacy_gateway_entries,
 )
 
@@ -67,3 +70,20 @@ def test_promoting_main_preserves_other_routes_only():
     assert result[CONF_DEVICE_ROUTES] == {
         "device-on-other-aux": "other-aux"
     }
+
+
+
+def test_pre_2026_8_registry_model_is_rejected():
+    assert not _registry_api_supported(
+        {"config_entries", "config_entries_subentries"},
+        {"add_config_entry_id", "remove_config_entry_id"},
+    )
+
+
+def test_2026_8_registry_model_is_accepted():
+    assert MINIMUM_HA_VERSION == "2026.8.1"
+    assert _registry_api_supported(
+        {"config_entry_id", "config_subentry_id"},
+        {"new_config_entry_id", "new_config_subentry_id"},
+    )
+    assert is_registry_migration_supported()

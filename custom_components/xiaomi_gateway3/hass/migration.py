@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+import inspect
 import logging
 from types import MappingProxyType
 from typing import Any
@@ -13,6 +14,7 @@ from homeassistant.config_entries import (
     ConfigEntryState,
     ConfigSubentry,
 )
+from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import (
     device_registry,
@@ -32,12 +34,55 @@ _LOGGER = logging.getLogger(__name__)
 
 TARGET_VERSION = 5
 TARGET_MINOR_VERSION = 1
+MINIMUM_HA_VERSION = "2026.8.1"
 ISSUE_LEGACY_CONFIG_MIGRATION = "legacy_config_migration"
 _NO_VIA_UPDATE = object()
 
 
 class MigrationError(RuntimeError):
     """Raised when a requested gateway topology migration cannot be completed."""
+
+
+class UnsupportedCoreVersionError(MigrationError):
+    """Raised before mutation when Core lacks the required registry model."""
+
+
+def _registry_api_supported(
+    device_attributes: set[str], update_parameters: set[str]
+) -> bool:
+    """Return whether Core exposes the singular 2026.8 registry API."""
+    return {
+        "config_entry_id",
+        "config_subentry_id",
+    } <= device_attributes and {
+        "new_config_entry_id",
+        "new_config_subentry_id",
+    } <= update_parameters
+
+
+def is_registry_migration_supported() -> bool:
+    """Return whether the running Core supports this migration implementation."""
+    device_attributes = {
+        attribute.name
+        for attribute in device_registry.DeviceEntry.__attrs_attrs__
+    }
+    update_parameters = set(
+        inspect.signature(
+            device_registry.DeviceRegistry.async_update_device
+        ).parameters
+    )
+    return _registry_api_supported(device_attributes, update_parameters)
+
+
+def ensure_registry_migration_supported() -> None:
+    """Reject unsupported Core versions before unloading or mutating entries."""
+    if is_registry_migration_supported():
+        return
+    raise UnsupportedCoreVersionError(
+        "Legacy gateway migration requires Home Assistant Core "
+        f"{MINIMUM_HA_VERSION} or newer; running {HA_VERSION}. "
+        "No config entries were changed by this attempt."
+    )
 
 
 def is_site_entry(entry: ConfigEntry) -> bool:
@@ -418,6 +463,7 @@ async def async_migrate_legacy_site(
     aux_entry_ids: Iterable[str],
 ) -> ConfigEntry:
     """Apply a topology selected and confirmed through a Repairs flow."""
+    ensure_registry_migration_supported()
     gateways = {entry.entry_id: entry for entry in legacy_gateway_entries(hass)}
     clouds = {entry.entry_id: entry for entry in legacy_cloud_entries(hass)}
 
@@ -581,6 +627,7 @@ async def async_promote_aux_gateway(
     subentry_id: str,
 ) -> None:
     """Promote an explicitly selected auxiliary gateway to main."""
+    ensure_registry_migration_supported()
     if not is_site_entry(entry):
         raise MigrationError("This config entry is not a gateway site")
     selected = entry.subentries.get(subentry_id)

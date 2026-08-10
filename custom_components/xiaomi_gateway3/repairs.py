@@ -17,6 +17,7 @@ from homeassistant.core import HomeAssistant
 from .hass.migration import (
     ISSUE_LEGACY_CONFIG_MIGRATION,
     MigrationError,
+    UnsupportedCoreVersionError,
     async_migrate_legacy_site,
     async_refresh_migration_issue,
     cloud_entry_label,
@@ -177,6 +178,9 @@ class LegacyConfigMigrationFlow(RepairsFlow):
                     main_entry_id=self.main_entry_id,
                     aux_entry_ids=self.aux_entry_ids,
                 )
+            except UnsupportedCoreVersionError as err:
+                _LOGGER.warning("Legacy gateway migration blocked: %s", err)
+                errors["base"] = "unsupported_core"
             except (MigrationError, AssertionError) as err:
                 _LOGGER.error("Legacy gateway migration failed", exc_info=err)
                 errors["base"] = "migration_failed"
